@@ -1,0 +1,223 @@
+import org.apache.hadoop.hbase.{CellUtil, HBaseConfiguration, TableName}
+import org.apache.hadoop.hbase.client._   
+import org.apache.hadoop.hbase.client.{Put, Table, ConnectionFactory, Connection} 
+import org.apache.hadoop.hbase.{HColumnDescriptor, HTableDescriptor, TableName}
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.conf.Configuration
+import scala.collection.JavaConverters._ 
+import scala.collection.mutable.ListBuffer 
+import org.apache.spark.sql.DataFrame
+import org.apache.hadoop.hbase.{TableName, HBaseConfiguration} 
+import org.apache.hadoop.hbase.client.coprocessor.{AggregationClient, LongColumnInterpreter, DoubleColumnInterpreter}
+import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp 
+import org.apache.hadoop.hbase.filter._
+
+
+
+val hConfig: Configuration = HBaseConfiguration.create()
+val connection: Connection = ConnectionFactory.createConnection(hConfig)
+val admin = connection.getAdmin 
+val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+import sqlContext.implicits._
+val metaTable: String = "delays_spark"; 
+val tableName: TableName = TableName.valueOf(metaTable); 
+
+
+
+// Code for creation of column family "delays_spark"
+
+val familyNameOne: String  = "dep";
+val familyNameTwo: String  = "arr";
+val tableDescriptor = new HTableDescriptor(tableName)
+val colOneDescriptor   = new HColumnDescriptor(familyNameOne)
+val colTwoDescriptor   = new HColumnDescriptor(familyNameTwo)   
+tableDescriptor.addFamily(colOneDescriptor)
+tableDescriptor.addFamily(colTwoDescriptor)
+admin.createTable(tableDescriptor)
+
+
+// Code to load data into column family "delays_spark"
+
+val table: Table = connection.getTable(tableName) 
+val flight_delays_df = spark.read.format("csv").option("header", "true").load("hdfs:///user/root/spark_data/*.csv")
+
+flight_delays_df.repartition(5)
+
+flight_delays_df.foreachPartition(partitionOfRecords => {
+	val hConfig: Configuration = HBaseConfiguration.create();
+    val connection: Connection = ConnectionFactory.createConnection(hConfig);
+    val table: Table = new HTable (hConfig, "delays_spark");
+
+	while(partitionOfRecords.hasNext) {
+		val row = partitionOfRecords.next;
+		val org = row.get(11).asInstanceOf[String];
+		val dest = row.get(14).asInstanceOf[String];
+
+		val keyValue = org + "_" + dest;
+
+
+		val flD = row.get(3).asInstanceOf[String];
+		val tlNo = row.get(7).asInstanceOf[String];
+
+		val colName = flD + "_" + tlNo;
+
+
+		val depDel = row.get(15).asInstanceOf[String];
+
+		val arrDel = row.get(16).asInstanceOf[String];
+		
+		if(keyValue != null && colName != null && depDel != null && arrDel != null ) {
+
+			val put : Put = new Put(Bytes.toBytes(keyValue));
+			put.addColumn(Bytes.toBytes("dep"), Bytes.toBytes(colName), Bytes.toBytes(depDel));
+			put.addColumn(Bytes.toBytes("arr"), Bytes.toBytes(colName), Bytes.toBytes(arrDel));
+          
+			table.put(put);
+		}
+	};
+
+	table.close();
+	connection.close();
+})
+
+
+
+// query one - arv and dep delay on 6/12/2016 from MSP tp PDX
+
+val allFilters = new FilterList(FilterList.Operator.MUST_PASS_ALL);
+allFilters.addFilter(new PrefixFilter(Bytes.toBytes("MSP_PDX")));
+allFilters.addFilter(new ColumnPrefixFilter(Bytes.toBytes("6/12/2016_")));
+
+val scan = new Scan();
+scan.setFilter(allFilters);
+
+val scanner = table.getScanner(scan);
+var result = scanner.next();
+
+
+while (result != null) {
+  for(cell <- result.rawCells()) {
+    println("row key:" + Bytes.toString(CellUtil.cloneRow(cell)) +
+      ":column family:" + Bytes.toString(CellUtil.cloneFamily(cell)) +
+      ":column name:" + Bytes.toString(CellUtil.cloneQualifier(cell)) +
+      ":value:" + Bytes.toString(CellUtil.cloneValue(cell)))
+  };
+  result = scanner.next();
+}
+
+/* answer - 
+
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N173SY:value:1                                                                                                  
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N325US:value:-13                                                                                                
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N364NW:value:-15                                                                                                
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N365NW:value:-17                                                                                                
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N802DN:value:5                                                                                                  
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N840DN:value:5                                                                                                  
+row key:MSP_PDX:column family:arr:column name:6/12/2016_N910DN:value:-3                                                                                                 
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N173SY:value:-6                                                                                                 
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N325US:value:-2                                                                                                 
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N364NW:value:-3                                                                                                 
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N365NW:value:0                                                                                                  
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N802DN:value:0                                                                                                  
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N840DN:value:4                                                                                                  
+row key:MSP_PDX:column family:dep:column name:6/12/2016_N910DN:value:19   
+
+*/
+
+
+// query two -  average arrival delay on 8/11/2016
+
+val aggregationClient = new AggregationClient(hConfig);
+val allFilters = new FilterList(FilterList.Operator.MUST_PASS_ALL);
+allFilters.addFilter(new FamilyFilter(CompareOp.EQUAL, new BinaryComparator(Bytes.toBytes("arr"))))
+allFilters.addFilter(new ColumnPrefixFilter(Bytes.toBytes("8/11/2016_")));
+
+val scan = new Scan();
+scan.setFilter(allFilters);
+val scanner = table.getScanner(scan);
+var result = scanner.next();
+
+var sum : Int = 0; 
+var flight_count: Int = 0;
+while (result != null) {
+  for(cell <- result.rawCells()) {
+    sum = sum + (Bytes.toString(CellUtil.cloneValue(cell))).toInt;
+	flight_count = flight_count + 1;
+  };
+  result = scanner.next();
+}
+
+
+
+println((sum.toDouble/ flight_count).toDouble )	
+
+//answer
+//10.368038434793602 
+
+
+
+
+// query three -  Total number of flights with arrival early or on time on 1/2/2016 -
+// We consider flights with negative or 0 arrival delay as flights that arrive early or on time 
+var flight_count : Int = 0;
+val allFilters = new FilterList(FilterList.Operator.MUST_PASS_ALL);
+allFilters.addFilter(new FamilyFilter(CompareOp.EQUAL, new BinaryComparator(Bytes.toBytes("arr"))))
+allFilters.addFilter(new ColumnPrefixFilter(Bytes.toBytes("1/2/2016_")));
+	
+val scan = new Scan();
+scan.setFilter(allFilters);
+val scanner = table.getScanner(scan);
+var result = scanner.next();
+
+
+while (result != null) {
+  for(cell <- result.rawCells()) {
+    val arr_delay = (Bytes.toString(CellUtil.cloneValue(cell))).toInt;
+	if (arr_delay < 1)  {
+		flight_count = flight_count + 1;
+	}
+  };
+  result = scanner.next();
+}
+
+println(flight_count)
+
+//answer
+//9757
+
+
+
+// query Four - Flights on 11/23/2016 that had greatest delay
+// We consider flight with max arrival delay on 11/23/2016
+val allFilters = new FilterList(FilterList.Operator.MUST_PASS_ALL);
+var arr_delay : Int = 0;
+var max_delay : Int = 0;
+var origin_destination : String = "";
+var max_orig_dest : String = "";
+
+allFilters.addFilter(new FamilyFilter(CompareOp.EQUAL, new BinaryComparator(Bytes.toBytes("arr"))))
+allFilters.addFilter(new ColumnPrefixFilter(Bytes.toBytes("11/23/2016_")));
+val scan = new Scan();
+scan.setFilter(allFilters);
+val scanner = table.getScanner(scan);
+var result = scanner.next();
+
+while (result != null) {
+  for(cell <- result.rawCells()) {
+	origin_destination = Bytes.toString(CellUtil.cloneRow(cell))
+    arr_delay = (Bytes.toString(CellUtil.cloneValue(cell))).toInt;
+	
+	if(arr_delay > max_delay) {
+		max_delay = arr_delay;
+		max_orig_dest = origin_destination;
+	};
+	
+    		
+  };
+  result = scanner.next();
+}
+
+println(" Maximum Arraival delay on 11/23/2016 is "+max_delay+" flight origin and destination : "+max_orig_dest)
+
+//Answer  ->  Maximum Arraival delay on 11/23/2016 is 777 flight origin and destination : ORD_CMX 
